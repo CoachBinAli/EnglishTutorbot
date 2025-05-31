@@ -66,12 +66,12 @@ async def send_audio(cid: int, audio: Union[str, Path], caption: str | None = No
         if isinstance(audio, Path):
             files = {"audio": (audio.name, audio.open("rb"))}
             data = {"chat_id": cid, **({"caption": caption} if caption else {})}
-            await hc.post(f"{TG_API}/sendAudio", data=data, files=files)
+            await hc.post(f"{TG_API}/sendDocument", data=data, files=files)
         else:  # URL string
             payload = {"chat_id": cid, "audio": audio}
             if caption:
                 payload["caption"] = caption
-            await hc.post(f"{TG_API}/sendAudio", json=payload)
+            await hc.post(f"{TG_API}/sendDocument", json=payload)
 
 
 async def download_voice(file_id: str) -> Path:
