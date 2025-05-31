@@ -1,19 +1,11 @@
 # main.py
 """
-GPT Telegram bot with **voice‑in (Whisper STT)** using the new OpenAI
-Python SDK and Replicate.  ✅ Fixed: use an explicit Whisper version ID so
-Replicate doesn’t 404.
+GPT Telegram bot with **voice‑in** (Whisper STT on Replicate) and the new
+OpenAI SDK.
 
-Flow ➜ voice OGG → Whisper (large‑v3) → text → GPT‑4‑mini → text reply.
-
-Build (Render):
-  pip install -r requirements.txt
-  uvicorn main:app --host 0.0.0.0 --port 8000
-
-Env vars (Render ➜ Environment):
-  TELEGRAM_BOT_TOKEN   # Telegram bot token
-  OPENAI_API_KEY       # OpenAI secret key
-  REPLICATE_API_TOKEN  # from https://replicate.com/account
+✔ Whisper pinned to large‑v3 hash so it never 404s.
+✔ Pass explicit `transcription="plain text"` and other recommended params
+  for consistent output.
 """
 from __future__ import annotations
 
@@ -30,112 +22,102 @@ from fastapi import FastAPI, HTTPException, Request
 from openai import AsyncOpenAI
 
 # ──────────────────────────────
-# Environment & clients
+# Env
 # ──────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REPLICATE_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 
-for key, val in {
+for k, v in {
     "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
     "OPENAI_API_KEY": OPENAI_API_KEY,
     "REPLICATE_API_TOKEN": REPLICATE_TOKEN,
 }.items():
-    if not val:
-        raise RuntimeError(f"Missing required env var: {key}")
+    if not v:
+        raise RuntimeError(f"Missing env var: {k}")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-replicate_client = replicate.Client(api_token=REPLICATE_TOKEN)
+rep_client = replicate.Client(api_token=REPLICATE_TOKEN)
 
-# Explicit version tag avoids 404
-WHISPER_VERSION = "openai/whisper:20231130"  # latest public large-v3
+WHISPER_HASH = (
+    "openai/whisper:8099696689d249cf8b122d833c36ac3f75505c666a395ca40ef26f68e7d3d16e"
+)
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-logger = logging.getLogger("bot")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
+log = logging.getLogger("bot")
 
 app = FastAPI()
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # ──────────────────────────────
 # Telegram helpers
 # ──────────────────────────────
-async def send_telegram_message(chat_id: int, text: str) -> None:
-    async with httpx.AsyncClient(timeout=15) as hc:
-        await hc.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-        )
-
-
-async def telegram_get_file_path(file_id: str) -> str:
-    async with httpx.AsyncClient(timeout=15) as hc:
-        r = await hc.get(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
-            params={"file_id": file_id},
-        )
+async def tg_call(method: str, **params) -> dict:
+    async with httpx.AsyncClient() as hc:
+        r = await hc.get(f"{TG_API}/{method}", params=params)
         r.raise_for_status()
-        return r.json()["result"]["file_path"]
+        return r.json()["result"]
 
 
-async def telegram_download_file(file_path: str) -> bytes:
-    async with httpx.AsyncClient(timeout=60) as hc:
-        r = await hc.get(
-            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+async def send_text(cid: int, text: str) -> None:
+    async with httpx.AsyncClient() as hc:
+        await hc.post(f"{TG_API}/sendMessage", json={"chat_id": cid, "text": text})
+
+
+async def download_voice(file_id: str) -> Path:
+    info = await tg_call("getFile", file_id=file_id)
+    async with httpx.AsyncClient() as hc:
+        data = await hc.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{info['file_path']}"
         )
-        r.raise_for_status()
-        return r.content
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg")
+    tmp.write(data.content)
+    tmp.close()
+    return Path(tmp.name)
 
 
 # ──────────────────────────────
-# STT helper
+# Whisper STT
 # ──────────────────────────────
-async def transcribe_voice(file_id: str) -> str:
-    """Download voice message and return Whisper transcription."""
-    try:
-        file_path = await telegram_get_file_path(file_id)
-        raw = await telegram_download_file(file_path)
-    except Exception as exc:
-        logger.exception("Telegram file download failed: %s", exc)
-        return "(audio download error)"
-
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        tmp.write(raw)
-        tmp_path = Path(tmp.name)
-
-    def _run_whisper() -> dict | list:
-        return replicate_client.run(
-            WHISPER_VERSION,
+async def transcribe(path: Path) -> str:
+    def _run():
+        audio_url = rep_client.files.upload(path)
+        return rep_client.run(
+            WHISPER_HASH,
             input={
-                "audio": open(tmp_path, "rb"),
+                "audio": audio_url,
                 "model": "large-v3",
                 "language": "en",
+                "transcription": "plain text",
+                "translate": False,
+                "temperature": 0,
+                "suppress_tokens": "-1",
+                "logprob_threshold": -1,
+                "no_speech_threshold": 0.6,
+                "condition_on_previous_text": True,
+                "compression_ratio_threshold": 2.4,
+                "temperature_increment_on_fallback": 0.2,
             },
         )
 
     try:
-        output = await asyncio.to_thread(_run_whisper)
-    except Exception as exc:
-        logger.exception("Replicate Whisper failed: %s", exc)
-        return "(speech‑to‑text error)"
+        out = await asyncio.to_thread(_run)
     finally:
         try:
-            tmp_path.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
         except OSError:
             pass
 
-    if isinstance(output, dict):
-        transcript = output.get("transcription", "")
-    else:  # list of segments
-        transcript = " ".join(seg.get("text", "") for seg in output)
-
-    logger.info("Whisper transcript ➜ %s", transcript)
+    transcript = out.get("transcription", "") if isinstance(out, dict) else ""
+    log.info("Whisper transcript → %s", transcript)
     return transcript or "(blank transcription)"
 
 
 # ──────────────────────────────
 # GPT helper
 # ──────────────────────────────
-async def generate_reply(prompt: str) -> str:
-    resp = await openai_client.chat.completions.create(
+async def chat(prompt: str) -> str:
+    rsp = await openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "You are a friendly English tutor."},
@@ -143,45 +125,44 @@ async def generate_reply(prompt: str) -> str:
         ],
         temperature=0.7,
     )
-    return resp.choices[0].message.content.strip()
+    return rsp.choices[0].message.content.strip()
 
 
 # ──────────────────────────────
 # Webhook
 # ──────────────────────────────
 @app.api_route("/webhook/{token}", methods=["POST", "GET", "HEAD"])
-async def telegram_webhook(token: str, request: Request):
+async def webhook(token: str, request: Request):
     if token != TELEGRAM_BOT_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid token in path")
+        raise HTTPException(403, "Bad token")
 
     if request.method in ("GET", "HEAD"):
         return {"ok": True}
 
-    update = await request.json()
-    message = update.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    if chat_id is None:
+    data = await request.json()
+    msg = data.get("message", {})
+    cid = msg.get("chat", {}).get("id")
+    if cid is None:
         return {"ok": True}
 
-    text: str | None = message.get("text")
-    if text is None and "voice" in message:
-        text = await transcribe_voice(message["voice"]["file_id"])
+    text = msg.get("text")
+    if text is None and "voice" in msg:
+        voice_path = await download_voice(msg["voice"]["file_id"])
+        text = await transcribe(voice_path)
 
     if text is None:
-        logger.info("Unsupported message type: keys=%s", message.keys())
+        log.info("Unsupported message")
         return {"ok": True}
 
-    logger.info("GPT prompt: %s", text)
+    log.info("GPT prompt: %s", text)
 
     try:
-        reply = await generate_reply(text)
-    except Exception as exc:
-        logger.exception("OpenAI error: %s", exc)
+        reply = await chat(text)
+    except Exception as e:
+        log.exception("OpenAI error: %s", e)
         reply = "Sorry, I'm having trouble thinking right now. Please try again later."
 
-    await send_telegram_message(chat_id, reply)
-    logger.info("Sent reply to %s", chat_id)
-
+    await send_text(cid, reply)
     return {"ok": True}
 
 
@@ -192,11 +173,4 @@ async def telegram_webhook(token: str, request: Request):
 async def root() -> dict[str, Literal["pong"]]:
     return {"status": "pong"}
 
-# ──────────────────────────────
-# requirements.txt (same folder)
-# fastapi==0.110.2
-# uvicorn[standard]==0.29.0
-# httpx==0.27.0
-# openai>=1.14
-# replicate==0.24.0
-# ──────────────────────────────
+# requirements.txt unchanged
