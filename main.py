@@ -1,13 +1,8 @@
 # main.py
 """
-GPT Telegram tutor with **voice‑in & voice‑out**.
-
-Fixes:
-• Handle Kokoro TTS binary response (stream) correctly: write to temp WAV
-  and upload to Telegram via **sendAudio** multipart.
-• Default voice set to `af_nicole` (matches Replicate example hash).
-
-Requirements unchanged (fastapi, uvicorn[standard], httpx, openai>=1.14, replicate==0.24.0)
+Telegram GPT tutor with **voice-in & voice-out** via Whisper + Kokoro.
+Fix: Handle all Kokoro output forms (stream, URL, list) and send via
+Telegram’s `sendAudio` using either an uploaded file or a direct URL.
 """
 from __future__ import annotations
 
@@ -16,15 +11,15 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Union
 
 import httpx
 import replicate
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Request
 from openai import AsyncOpenAI
 
 # ──────────────────────────────
-# Environment vars
+# Env vars
 # ──────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -41,13 +36,9 @@ for k, v in {
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 rep_client = replicate.Client(api_token=REPLICATE_TOKEN)
 
-WHISPER_MODEL = (
-    "openai/whisper:8099696689d249cf8b122d833c36ac3f75505c666a395ca40ef26f68e7d3d16e"
-)
-KOKORO_MODEL = (
-    "jaaari/kokoro-82m:f559560eb822dc509045f3921a1921234918b91739db4bf3daab2169b71c7a13"
-)
-VOICE_ID = "af_nicole"
+WHISPER = "openai/whisper:8099696689d249cf8b122d833c36ac3f75505c666a395ca40ef26f68e7d3d16e"
+KOKORO = "jaaari/kokoro-82m:f559560eb822dc509045f3921a1921234918b91739db4bf3daab2169b71c7a13"
+VOICE = "af_nicole"
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
 log = logging.getLogger("bot")
@@ -65,22 +56,22 @@ async def tg_get(method: str, **params) -> dict:
         return r.json()["result"]
 
 
-async def tg_post_multipart(endpoint: str, files: dict, data: dict) -> None:
-    async with httpx.AsyncClient() as hc:
-        await hc.post(f"{TG_API}/{endpoint}", data=data, files=files, timeout=60)
-
-
 async def send_text(cid: int, text: str) -> None:
     async with httpx.AsyncClient() as hc:
         await hc.post(f"{TG_API}/sendMessage", json={"chat_id": cid, "text": text})
 
 
-async def send_audio(cid: int, path: Path, caption: str | None = None) -> None:
-    files = {"audio": (path.name, path.open("rb"))}
-    data = {"chat_id": cid}
-    if caption:
-        data["caption"] = caption
-    await tg_post_multipart("sendAudio", files, data)
+async def send_audio(cid: int, audio: Union[str, Path], caption: str | None = None) -> None:
+    async with httpx.AsyncClient(timeout=60) as hc:
+        if isinstance(audio, Path):
+            files = {"audio": (audio.name, audio.open("rb"))}
+            data = {"chat_id": cid, **({"caption": caption} if caption else {})}
+            await hc.post(f"{TG_API}/sendAudio", data=data, files=files)
+        else:  # URL string
+            payload = {"chat_id": cid, "audio": audio}
+            if caption:
+                payload["caption"] = caption
+            await hc.post(f"{TG_API}/sendAudio", json=payload)
 
 
 async def download_voice(file_id: str) -> Path:
@@ -96,42 +87,48 @@ async def download_voice(file_id: str) -> Path:
 
 
 # ──────────────────────────────
-# Replicate helpers
+# Replicate wrappers
 # ──────────────────────────────
 async def transcribe(audio_path: Path) -> str:
     def _run():
         return rep_client.run(
-            WHISPER_MODEL,
+            WHISPER,
             input={"audio": audio_path.open("rb"), "model": "large-v3", "language": "en", "transcription": "plain text", "temperature": 0},
         )
 
     try:
-        result = await asyncio.to_thread(_run)
+        out = await asyncio.to_thread(_run)
     finally:
         audio_path.unlink(missing_ok=True)
 
-    transcript = result.get("transcription", "") if isinstance(result, dict) else ""
+    transcript = out.get("transcription", "") if isinstance(out, dict) else ""
     log.info("Whisper transcript: %s", transcript)
     return transcript or "(blank)"
 
 
-async def synthesize(text: str, voice: str = VOICE_ID) -> Path:
+async def synthesize(text: str, voice: str = VOICE) -> Union[str, Path]:
     def _run():
-        return rep_client.run(KOKORO_MODEL, input={"text": text, "voice": voice})
+        return rep_client.run(KOKORO, input={"text": text, "voice": voice, "speed": 1})
 
     out = await asyncio.to_thread(_run)
-    # out is a binary stream-like object
+
+    # Cases: bytes-like stream, URL string, list[str]
     if hasattr(out, "read"):
         audio_bytes = out.read()
-    elif isinstance(out, bytes):
-        audio_bytes = out
-    else:
-        raise ValueError("Unexpected Kokoro output type")
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    tmp.write(audio_bytes)
-    tmp.close()
-    return Path(tmp.name)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        tmp.write(audio_bytes)
+        tmp.close()
+        return Path(tmp.name)
+    if isinstance(out, bytes):
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        tmp.write(out)
+        tmp.close()
+        return Path(tmp.name)
+    if isinstance(out, str):
+        return out
+    if isinstance(out, list) and out and isinstance(out[0], str):
+        return out[0]
+    raise ValueError("Unknown Kokoro output type")
 
 
 # ──────────────────────────────
@@ -153,7 +150,6 @@ async def chat(prompt: str) -> str:
 async def webhook(token: str, request: Request):
     if token != TELEGRAM_BOT_TOKEN:
         raise HTTPException(403)
-
     if request.method in ("GET", "HEAD"):
         return {"ok": True}
 
@@ -165,7 +161,6 @@ async def webhook(token: str, request: Request):
 
     is_voice = "voice" in msg and "text" not in msg
     prompt = msg.get("text", "")
-
     if is_voice:
         prompt = await transcribe(await download_voice(msg["voice"]["file_id"]))
 
@@ -179,14 +174,15 @@ async def webhook(token: str, request: Request):
         reply = await chat(prompt)
     except Exception as e:
         log.exception("OpenAI error: %s", e)
-        await send_text(cid, "Sorry, something went wrong. Try again later.")
+        await send_text(cid, "Sorry, something went wrong. Try later.")
         return {"ok": True}
 
     if is_voice:
         try:
-            wav_path = await synthesize(reply)
-            await send_audio(cid, wav_path, caption=reply)
-            wav_path.unlink(missing_ok=True)
+            audio_ref = await synthesize(reply)
+            await send_audio(cid, audio_ref, caption=reply)
+            if isinstance(audio_ref, Path):
+                audio_ref.unlink(missing_ok=True)
         except Exception as e:
             log.exception("TTS error: %s", e)
             await send_text(cid, reply)
@@ -197,7 +193,7 @@ async def webhook(token: str, request: Request):
 
 
 # ──────────────────────────────
-# Health
+# Health check
 # ──────────────────────────────
 @app.get("/")
 async def root() -> dict[str, Literal["pong"]]:
