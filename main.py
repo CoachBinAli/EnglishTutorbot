@@ -1,18 +1,21 @@
-# telegram_gpt_bot/main.py
-"""Minimal text-only GPT Telegram bot for Render deployment.
+# main.py
+"""
+Minimal text-only GPT Telegram bot, ready for Render deployment.
 
-Now includes **GET/HEAD** support on the webhook endpoint so Telegram's
-initial handshake succeeds (Telegram performs a GET request right after
-`setWebhook` and expects **200 OK**).
+✓ Supports POST, GET & HEAD on /webhook/{token}
+✓ Adds a root “/” health-check (Render pings this)
+✓ Uses async OpenAI client (>= 1.14)
 
-Build command (Render → Build Command):
+Build command on Render:
   pip install -r requirements.txt
   uvicorn main:app --host 0.0.0.0 --port 8000
 
-Environment variables required in Render:
-  TELEGRAM_BOT_TOKEN   # Your bot token, e.g. 123456:ABC-DEF…
-  OPENAI_API_KEY       # Your OpenAI secret key
+Environment variables to add on Render:
+  TELEGRAM_BOT_TOKEN   # your bot token
+  OPENAI_API_KEY       # your OpenAI secret key
 """
+
+from __future__ import annotations
 
 import logging
 import os
@@ -22,15 +25,15 @@ import httpx
 import openai
 from fastapi import FastAPI, HTTPException, Request
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 # Environment
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not TELEGRAM_BOT_TOKEN or not OPENAI_API_KEY:
     raise RuntimeError(
-        "Environment variables TELEGRAM_BOT_TOKEN and OPENAI_API_KEY must be set."
+        "Set TELEGRAM_BOT_TOKEN and OPENAI_API_KEY as environment variables."
     )
 
 openai.api_key = OPENAI_API_KEY
@@ -38,11 +41,12 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+
+# ────────────────────────────────────────────────────────────────────────────
+# Helper functions
+# ────────────────────────────────────────────────────────────────────────────
 async def send_telegram_message(chat_id: int, text: str) -> None:
-    """Send a plain‑text message back to the user via Telegram."""
+    """Send a plaintext message back to the user via Telegram."""
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -51,9 +55,9 @@ async def send_telegram_message(chat_id: int, text: str) -> None:
 
 
 async def generate_reply(prompt: str) -> str:
-    """Generate a conversational reply using GPT‑4‑mini (or your available model)."""
+    """Generate a conversational reply via OpenAI."""
     completion = await openai.ChatCompletion.acreate(
-        model="gpt-4o-mini",  # adjust to whatever model name your key allows
+        model="gpt-4o-mini",   # adjust to whatever model name your key supports
         messages=[
             {"role": "system", "content": "You are a friendly English tutor."},
             {"role": "user", "content": prompt},
@@ -63,24 +67,23 @@ async def generate_reply(prompt: str) -> str:
     return completion.choices[0].message.content.strip()
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 # Webhook endpoint
-# ---------------------------------------------------------------------------
-@app.api_route(
-    "/webhook/{token}",
-    methods=["POST", "GET", "HEAD"],
-)
+# ────────────────────────────────────────────────────────────────────────────
+@app.api_route("/webhook/{token}", methods=["POST", "GET", "HEAD"])
 async def telegram_webhook(token: str, request: Request):
-    """Handle Telegram webhook verification (GET/HEAD) and updates (POST)."""
-
+    """
+    • Telegram calls GET/HEAD right after setWebhook → return 200 OK
+    • Telegram sends updates as POST JSON payloads
+    """
     if token != TELEGRAM_BOT_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token in path")
 
-    # 1. Telegram handshake – they call GET/HEAD right after setWebhook.
+    # Handshake request
     if request.method in ("GET", "HEAD"):
         return {"ok": True}
 
-    # 2. Incoming update
+    # Incoming update
     update: dict = await request.json()
 
     message = update.get("message", {})
@@ -88,8 +91,7 @@ async def telegram_webhook(token: str, request: Request):
     chat_id: int | None = message.get("chat", {}).get("id")
 
     if chat_id is None or text is None:
-        # Only handle text for the MVP
-        logging.info("Ignoring non‑text update: %s", update)
+        logging.info("Ignoring non-text update: %s", update)
         return {"ok": True}
 
     logging.info("Received message from %s: %s", chat_id, text)
@@ -99,7 +101,8 @@ async def telegram_webhook(token: str, request: Request):
     except Exception as exc:  # noqa: BLE001
         logging.exception("OpenAI request failed: %s", exc)
         reply_text = (
-            "Sorry, I’m having trouble generating a reply right now. Please try again later."  # noqa: E501
+            "Sorry, I’m having trouble generating a reply right now. "
+            "Please try again later."
         )
 
     await send_telegram_message(chat_id, reply_text)
@@ -108,18 +111,10 @@ async def telegram_webhook(token: str, request: Request):
     return {"ok": True}
 
 
-# ---------------------------------------------------------------------------
-# Health‑check root (optional)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
+# Health-check root
+# ────────────────────────────────────────────────────────────────────────────
 @app.get("/")
-async def root() -> dict[str, Literal["ok", "pong"]]:
-    """Simple health check for Render."""
+async def root() -> dict[str, Literal["pong"]]:
+    """Render health-check."""
     return {"status": "pong"}
-
-# ---------------------------------------------------------------------------
-# requirements.txt (same folder)
-# fastapi==0.110.2
-# uvicorn[standard]==0.29.0
-# httpx==0.27.0
-# openai>=1.14
-# ---------------------------------------------------------------------------
