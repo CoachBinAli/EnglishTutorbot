@@ -2,3 +2,4 @@ fastapi==0.110.2
 uvicorn[standard]==0.29.0
 httpx==0.27.0
 openai>=1.14      # pin pre-1.0 client
+replicate==0.24.0
