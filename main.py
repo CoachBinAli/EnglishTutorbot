@@ -1,11 +1,9 @@
 # main.py
 """
-GPT Telegram bot with **voice‑in** (Whisper STT on Replicate) and the new
-OpenAI SDK.
+GPT Telegram bot with **voice‑in (Whisper STT)** and new OpenAI SDK.
 
-✔ Whisper pinned to large‑v3 hash so it never 404s.
-✔ Pass explicit `transcription="plain text"` and other recommended params
-  for consistent output.
+🔧 Fix: use a plain file handle for `audio`; Replicate’s Python SDK < 0.25
+has no `client.files.upload` helper. The hash‑pinned model stays the same.
 """
 from __future__ import annotations
 
@@ -22,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from openai import AsyncOpenAI
 
 # ──────────────────────────────
-# Env
+# Env & clients
 # ──────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -81,22 +79,15 @@ async def download_voice(file_id: str) -> Path:
 # ──────────────────────────────
 async def transcribe(path: Path) -> str:
     def _run():
-        audio_url = rep_client.files.upload(path)
         return rep_client.run(
             WHISPER_HASH,
             input={
-                "audio": audio_url,
+                "audio": open(path, "rb"),  # pass file handle directly
                 "model": "large-v3",
                 "language": "en",
                 "transcription": "plain text",
                 "translate": False,
                 "temperature": 0,
-                "suppress_tokens": "-1",
-                "logprob_threshold": -1,
-                "no_speech_threshold": 0.6,
-                "condition_on_previous_text": True,
-                "compression_ratio_threshold": 2.4,
-                "temperature_increment_on_fallback": 0.2,
             },
         )
 
@@ -108,7 +99,9 @@ async def transcribe(path: Path) -> str:
         except OSError:
             pass
 
-    transcript = out.get("transcription", "") if isinstance(out, dict) else ""
+    transcript = (
+        out.get("transcription", "") if isinstance(out, dict) else ""
+    )
     log.info("Whisper transcript → %s", transcript)
     return transcript or "(blank transcription)"
 
@@ -147,8 +140,7 @@ async def webhook(token: str, request: Request):
 
     text = msg.get("text")
     if text is None and "voice" in msg:
-        voice_path = await download_voice(msg["voice"]["file_id"])
-        text = await transcribe(voice_path)
+        text = await transcribe(await download_voice(msg["voice"]["file_id"]))
 
     if text is None:
         log.info("Unsupported message")
@@ -160,7 +152,7 @@ async def webhook(token: str, request: Request):
         reply = await chat(text)
     except Exception as e:
         log.exception("OpenAI error: %s", e)
-        reply = "Sorry, I'm having trouble thinking right now. Please try again later."
+        reply = "Sorry, something went wrong. Please try again."
 
     await send_text(cid, reply)
     return {"ok": True}
